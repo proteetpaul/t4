@@ -80,6 +80,12 @@ Why this matters:
 - Better fit for a pinned worker / thread-per-core execution model
 - Linux-only implementation
 
+### Backend selection (`MountOptions::io_backend`)
+
+- **`IoBackendKind::DedicatedThread` (default):** one background thread owns the store `File` and a single `io_uring` ring. Completion wakeups are thread-safe; you may poll store futures on any executor (for example `pollster` on the main thread).
+
+- **`IoBackendKind::WorkStealing` (omitted when the `shuttle` feature is enabled):** several worker threads each `dup` the store fd and run their own ring with a small local executor (`async-task`) plus batched `io_uring_enter`. Submissions are issued from thread-local state; **all store I/O futures must be polled on those workers**. Mount uses `WorkStealingIo::run_to_completion` for the initial WAL open/replay. After mount, if you drive the public `Store` API from another thread’s executor, work-stealing I/O will misbehave or panic; run `put`/`get`/etc. as tasks on the same pool (for example by scheduling them with `WorkStealingIo::run_to_completion` or an executor pinned to that pool). Fixed `IORING_REGISTER_BUFFERS` is not implemented yet.
+
 ## Core Operations
 
 ### `mount`

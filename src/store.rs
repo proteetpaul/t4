@@ -1,24 +1,32 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::OpenOptions;
 use std::num::NonZeroU32;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use verified::input_kv::{T4Key, T4KeyRef, T4Value, ValueRef};
 use verified::{CheckedRangeU32, RangeRequestU32};
 
 use crate::buffer::{AlignedBuf, align_down_u64, align_up_u32, align_up_u64};
 use crate::error::{Error, Result};
+use crate::io_backend::{read_exact_at, IoBackendRef};
+#[cfg(not(feature = "shuttle"))]
+use crate::uring_runtime::NonBlockingUring;
 use crate::io_worker::IoWorker;
 use crate::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::wal::Wal;
 use crate::{PAGE_SIZE_NZ_U32, PAGE_SIZE_U64};
 
-#[derive(Debug, Clone, Copy)]
+pub use crate::io_backend::IoBackendKind;
+
+#[derive(Debug, Clone)]
 pub struct MountOptions {
     pub queue_depth: u32,
     pub direct_io: bool,
     pub dsync: bool,
+    pub io_backend: IoBackendKind,
 }
 
 impl Default for MountOptions {
@@ -27,15 +35,21 @@ impl Default for MountOptions {
             queue_depth: 256,
             direct_io: true,
             dsync: true,
+            io_backend: IoBackendKind::default(),
         }
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct T4Store {
-    io: IoWorker,
+    io: IoBackendRef,
     wal: Wal,
     index: RwLock<HashMap<T4Key, ValueRef>>,
+}
+
+impl fmt::Debug for T4Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("T4Store").finish_non_exhaustive()
+    }
 }
 
 impl T4Store {
@@ -56,20 +70,43 @@ impl T4Store {
         let len = file.metadata()?.len();
         let queue_depth = NonZeroU32::new(options.queue_depth)
             .ok_or(Error::InvalidArgument("queue_depth must be > 0"))?;
-        let io = IoWorker::new(queue_depth, file)?;
 
-        let (wal, index) = if len == 0 {
-            let wal = Wal::create(io.clone()).await?;
-            (wal, HashMap::new())
-        } else {
-            Wal::replay(io.clone(), len).await?
-        };
+        #[cfg(not(feature = "shuttle"))]
+        {
+            if let IoBackendKind::WorkStealing { io_threads } = options.io_backend {
+                let ws = NonBlockingUring::new(&file, queue_depth, io_threads)?;
+                let io: IoBackendRef = Arc::new(ws.clone());
+                let io_mount = io.clone();
+                let (wal, index) = ws.run_to_completion(async move {
+                    Self::open_wal_and_index(io_mount, len).await
+                })?;
+                return Ok(Self {
+                    io,
+                    wal,
+                    index: RwLock::new(index),
+                });
+            }
+        }
 
+        let io: IoBackendRef = Arc::new(IoWorker::new(queue_depth, file)?);
+        let (wal, index) = Self::open_wal_and_index(io.clone(), len).await?;
         Ok(Self {
             io,
             wal,
             index: RwLock::new(index),
         })
+    }
+
+    async fn open_wal_and_index(
+        io: IoBackendRef,
+        len: u64,
+    ) -> Result<(Wal, HashMap<T4Key, ValueRef>)> {
+        if len == 0 {
+            let wal = Wal::create(io.clone()).await?;
+            Ok((wal, HashMap::new()))
+        } else {
+            Wal::replay(io.clone(), len).await
+        }
     }
 
     fn read_index(&self) -> Result<RwLockReadGuard<'_, HashMap<T4Key, ValueRef>>> {
@@ -97,7 +134,7 @@ impl T4Store {
         let padded_u32 = align_up_u32(value_len_u32, PAGE_SIZE_NZ_U32)
             .map_err(|_| Error::Format("value length exceeds io buffer limit".into()))?;
         let buf = AlignedBuf::new_zeroed(padded_u32)?;
-        let buf = self.io.read_exact_at(buf, value.offset).await?;
+        let buf = read_exact_at(&self.io, buf, value.offset).await?;
         let value_len = value_len_u32.get() as usize;
         Ok(buf.as_slice()[..value_len].to_vec())
     }
@@ -134,7 +171,7 @@ impl T4Store {
             .map_err(|_| Error::RangeOutOfBounds)?;
         let read_len_u32 = NonZeroU32::new(read_len_u32).ok_or(Error::RangeOutOfBounds)?;
         let buf = AlignedBuf::new_zeroed(read_len_u32)?;
-        let buf = self.io.read_exact_at(buf, aligned_start).await?;
+        let buf = read_exact_at(&self.io, buf, aligned_start).await?;
 
         let slice_start_u64 = abs_start
             .checked_sub(aligned_start)

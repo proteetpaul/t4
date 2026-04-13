@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::buffer::AlignedBuf;
 use crate::error::{Error, Result};
+use crate::io_backend::{read_exact_at, IoBackendRef};
 use crate::io_task::PageWrite;
-use crate::io_worker::IoWorker;
 use crate::sync::{Mutex, MutexGuard};
 use crate::{PAGE_SIZE_NZ_U32, PAGE_SIZE_U32, PAGE_SIZE_U64};
 
@@ -21,19 +21,21 @@ struct WalState {
 }
 
 pub struct Wal {
-    io: IoWorker,
+    io: IoBackendRef,
     state: Mutex<WalState>,
 }
 
 impl std::fmt::Debug for Wal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Wal").finish_non_exhaustive()
     }
 }
 
+use std::fmt;
+
 impl Wal {
     /// Initialize the WAL for a newly created (empty) file.
-    pub async fn create(io: IoWorker) -> Result<Self> {
+    pub async fn create(io: IoBackendRef) -> Result<Self> {
         let page = WalPage::empty();
         let mut buf = AlignedBuf::new_zeroed(PAGE_SIZE_NZ_U32)?;
         buf.as_mut_slice().copy_from_slice(page.as_slice());
@@ -50,7 +52,7 @@ impl Wal {
     }
 
     /// Replay an existing WAL, rebuilding the in-memory index.
-    pub async fn replay(io: IoWorker, file_len: u64) -> Result<(Self, HashMap<T4Key, ValueRef>)> {
+    pub async fn replay(io: IoBackendRef, file_len: u64) -> Result<(Self, HashMap<T4Key, ValueRef>)> {
         if file_len < PAGE_SIZE_U64 {
             return Err(Error::Format(
                 "store file shorter than first WAL page".into(),
@@ -179,9 +181,9 @@ impl Wal {
         Ok(PageWrite { buf, offset })
     }
 
-    async fn read_page(io: &IoWorker, offset: u64) -> Result<WalPage> {
+    async fn read_page(io: &IoBackendRef, offset: u64) -> Result<WalPage> {
         let buf = AlignedBuf::new_zeroed(PAGE_SIZE_NZ_U32)?;
-        let buf = io.read_exact_at(buf, offset).await?;
+        let buf = read_exact_at(io, buf, offset).await?;
         let boxed = buf
             .try_into_boxed_array()
             .expect("invalid aligned buffer layout");

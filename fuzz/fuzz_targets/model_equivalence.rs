@@ -75,6 +75,7 @@ fn test_options() -> MountOptions {
         queue_depth: 32,
         direct_io: false,
         dsync: false,
+        io_backend: t4::IoBackendKind::DedicatedThread,
     }
 }
 

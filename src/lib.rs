@@ -3,8 +3,11 @@
 pub mod art;
 mod buffer;
 mod error;
+mod io_backend;
 mod io_task;
 mod io_worker;
+#[cfg(not(feature = "shuttle"))]
+mod uring_runtime;
 mod store;
 mod sync;
 mod wal;
@@ -15,7 +18,7 @@ use crate::store::T4Store;
 use crate::sync::Arc;
 
 pub use error::{Error, Result};
-pub use store::MountOptions;
+pub use store::{IoBackendKind, MountOptions};
 use verified::input_kv::{T4Key, T4KeyRef, T4Value};
 
 pub const PAGE_SIZE: usize = 4096;

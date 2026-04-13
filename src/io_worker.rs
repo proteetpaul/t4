@@ -8,6 +8,7 @@ use io_uring::{IoUring, opcode, types};
 
 use crate::buffer::AlignedBuf;
 use crate::error::{Error, Result};
+use crate::io_backend::{FsyncFutBox, IoBackend, ReadFutBox, WriteFutBox};
 use crate::io_task::{
     FileFsyncTask, FileReadTask, FileWriteTask, PageWrite, WorkerRequest, worker_disconnected_error,
 };
@@ -624,28 +625,18 @@ impl IoWorker {
             Err(_) => Err(worker_disconnected_error()),
         }
     }
+}
 
-    pub fn read_at(&self, buf: AlignedBuf, offset: u64) -> FileReadTask {
-        FileReadTask::new((*self.tx).clone(), buf, offset)
+impl IoBackend for IoWorker {
+    fn read_at(&self, buf: AlignedBuf, offset: u64) -> ReadFutBox {
+        Box::pin(FileReadTask::new((*self.tx).clone(), buf, offset))
     }
 
-    pub fn write(&self, writes: Vec<PageWrite>) -> FileWriteTask {
-        FileWriteTask::new((*self.tx).clone(), writes)
+    fn write(&self, writes: Vec<PageWrite>) -> WriteFutBox {
+        Box::pin(FileWriteTask::new((*self.tx).clone(), writes))
     }
 
-    pub fn fsync(&self) -> FileFsyncTask {
-        FileFsyncTask::new((*self.tx).clone())
-    }
-
-    pub async fn read_exact_at(&self, buf: AlignedBuf, offset: u64) -> Result<AlignedBuf> {
-        let expected = buf.len();
-        let (buf, n) = self.read_at(buf, offset).await?;
-        if n != expected {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short read: expected {expected}, got {n}"),
-            )));
-        }
-        Ok(buf)
+    fn fsync(&self) -> FsyncFutBox {
+        Box::pin(FileFsyncTask::new((*self.tx).clone()))
     }
 }

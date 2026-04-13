@@ -4,10 +4,11 @@
 
 ## Features
 
+- **Linux only** (`io_uring`); building on other targets fails with a clear error.
 - Performance, correctness, and ergonomics, pick three. 
 - `io_uring` for all I/O, scale to modern SSDs.
 - Deterministic, predictable performance, one request is one I/O.
-- Runtime-agnostic async API.
+- Runtime-agnostic async API (default I/O backend); optional work-stealing `io_uring` pool via `MountOptions::io_backend` (not with `shuttle`)—see [doc/design.md](doc/design.md) for execution constraints.
 
 ## Usage
 
