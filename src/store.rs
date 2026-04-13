@@ -9,7 +9,8 @@ use std::sync::Arc;
 use verified::input_kv::{T4Key, T4KeyRef, T4Value, ValueRef};
 use verified::{CheckedRangeU32, RangeRequestU32};
 
-use crate::buffer::{AlignedBuf, align_down_u64, align_up_u32, align_up_u64};
+use crate::buffer::{align_down_u64, align_up_u32, align_up_u64, try_read_buf};
+use crate::memory::pool::FixedBufferPool;
 use crate::error::{Error, Result};
 use crate::io_backend::{read_exact_at, IoBackendRef};
 #[cfg(not(feature = "shuttle"))]
@@ -27,6 +28,8 @@ pub struct MountOptions {
     pub direct_io: bool,
     pub dsync: bool,
     pub io_backend: IoBackendKind,
+    /// Size of the mmap fixed-buffer arena (used for reads via `ReadFixed` when registered).
+    pub fixed_buffer_pool_size_mb: usize,
 }
 
 impl Default for MountOptions {
@@ -36,6 +39,7 @@ impl Default for MountOptions {
             direct_io: true,
             dsync: true,
             io_backend: IoBackendKind::default(),
+            fixed_buffer_pool_size_mb: 128,
         }
     }
 }
@@ -54,6 +58,8 @@ impl fmt::Debug for T4Store {
 
 impl T4Store {
     pub async fn mount_with_options(path: impl AsRef<Path>, options: MountOptions) -> Result<Self> {
+        FixedBufferPool::init(options.fixed_buffer_pool_size_mb);
+
         let mut open = OpenOptions::new();
         open.read(true).write(true).create(true);
 
@@ -133,7 +139,7 @@ impl T4Store {
         };
         let padded_u32 = align_up_u32(value_len_u32, PAGE_SIZE_NZ_U32)
             .map_err(|_| Error::Format("value length exceeds io buffer limit".into()))?;
-        let buf = AlignedBuf::new_zeroed(padded_u32)?;
+        let buf = try_read_buf(padded_u32)?;
         let buf = read_exact_at(&self.io, buf, value.offset).await?;
         let value_len = value_len_u32.get() as usize;
         Ok(buf.as_slice()[..value_len].to_vec())
@@ -170,7 +176,7 @@ impl T4Store {
             .try_into()
             .map_err(|_| Error::RangeOutOfBounds)?;
         let read_len_u32 = NonZeroU32::new(read_len_u32).ok_or(Error::RangeOutOfBounds)?;
-        let buf = AlignedBuf::new_zeroed(read_len_u32)?;
+        let buf = try_read_buf(read_len_u32)?;
         let buf = read_exact_at(&self.io, buf, aligned_start).await?;
 
         let slice_start_u64 = abs_start

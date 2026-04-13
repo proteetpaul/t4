@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::buffer::AlignedBuf;
+use crate::buffer::ReadBuf;
 use crate::error::{Error, Result};
 use crate::io_task::PageWrite;
 
@@ -43,7 +43,7 @@ use crate::io_task::PageWrite;
 pub(crate) type IoBackendRef = Arc<dyn IoBackend + Send + Sync>;
 
 /// Type-erased read future (one heap allocation per `read_at` in this design).
-pub(crate) type ReadFutBox = Pin<Box<dyn Future<Output = Result<(AlignedBuf, usize)>> + Send + 'static>>;
+pub(crate) type ReadFutBox = Pin<Box<dyn Future<Output = Result<(ReadBuf, usize)>> + Send + 'static>>;
 
 pub(crate) type WriteFutBox = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 
@@ -54,7 +54,7 @@ pub(crate) type FsyncFutBox = Pin<Box<dyn Future<Output = Result<()>> + Send + '
 /// Implemented by [`crate::io_worker::IoWorker`] and [`crate::uring_runtime::WorkStealingIo`].
 /// Sharing uses [`IoArc`]; the trait does not require [`Clone`] on `Self`.
 pub(crate) trait IoBackend: Send + Sync {
-    fn read_at(&self, buf: AlignedBuf, offset: u64) -> ReadFutBox;
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> ReadFutBox;
     fn write(&self, writes: Vec<PageWrite>) -> WriteFutBox;
     fn fsync(&self) -> FsyncFutBox;
 }
@@ -75,7 +75,7 @@ pub enum IoBackendKind {
 }
 
 /// Exact-length read: issues [`IoBackend::read_at`] and checks length.
-pub(crate) fn read_exact_at(io: &IoBackendRef, buf: AlignedBuf, offset: u64) -> ReadExactAt {
+pub(crate) fn read_exact_at(io: &IoBackendRef, buf: ReadBuf, offset: u64) -> ReadExactAt {
     ReadExactAt::new(io.clone(), buf, offset)
 }
 
@@ -88,14 +88,14 @@ pub(crate) struct ReadExactAt {
 
 enum ReadExactState {
     Start {
-        buf: Option<AlignedBuf>,
+        buf: Option<ReadBuf>,
         offset: u64,
     },
     Reading(ReadFutBox),
 }
 
 impl ReadExactAt {
-    fn new(io: IoBackendRef, buf: AlignedBuf, offset: u64) -> Self {
+    fn new(io: IoBackendRef, buf: ReadBuf, offset: u64) -> Self {
         let expected = buf.len();
         Self {
             io,
@@ -109,7 +109,7 @@ impl ReadExactAt {
 }
 
 impl Future for ReadExactAt {
-    type Output = Result<AlignedBuf>;
+    type Output = Result<ReadBuf>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();

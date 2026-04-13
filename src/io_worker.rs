@@ -6,7 +6,8 @@ use std::os::fd::AsRawFd;
 
 use io_uring::{IoUring, opcode, types};
 
-use crate::buffer::AlignedBuf;
+use crate::buffer::{AlignedBuf, ReadBuf};
+use crate::memory::pool::FixedBufferPool;
 use crate::error::{Error, Result};
 use crate::io_backend::{FsyncFutBox, IoBackend, ReadFutBox, WriteFutBox};
 use crate::io_task::{
@@ -52,23 +53,20 @@ trait IoDriver {
     fn pop_completion(&mut self) -> Option<CompletionEvent>;
 }
 
-struct ReadEntry<'a> {
+struct ReadEntry {
     fd: i32,
-    buf: &'a mut AlignedBuf,
+    ptr: *mut u8,
+    len: u32,
     offset: u64,
     user_data: u64,
 }
 
-impl From<ReadEntry<'_>> for io_uring::squeue::Entry {
-    fn from(value: ReadEntry<'_>) -> Self {
-        opcode::Read::new(
-            types::Fd(value.fd),
-            value.buf.as_mut_ptr(),
-            value.buf.len_u32(),
-        )
-        .offset(value.offset)
-        .build()
-        .user_data(value.user_data)
+impl From<ReadEntry> for io_uring::squeue::Entry {
+    fn from(value: ReadEntry) -> Self {
+        opcode::Read::new(types::Fd(value.fd), value.ptr, value.len)
+            .offset(value.offset)
+            .build()
+            .user_data(value.user_data)
     }
 }
 
@@ -105,9 +103,11 @@ impl From<FsyncEntry> for io_uring::squeue::Entry {
 
 impl UringDriver {
     fn new(queue_depth: u32) -> Result<Self> {
-        Ok(Self {
-            ring: IoUring::new(queue_depth)?,
-        })
+        let ring = IoUring::new(queue_depth)?;
+        if let Err(e) = FixedBufferPool::register_buffers_with_ring(&ring) {
+            log::warn!("fixed buffer register_buffers failed: {e}");
+        }
+        Ok(Self { ring })
     }
 
     fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<()> {
@@ -157,9 +157,10 @@ struct InflightRequest {
 
 enum InflightRequestKind {
     Read {
-        buf: Option<AlignedBuf>,
+        buf: Option<ReadBuf>,
         completion: ReadCompletion,
-        result: Option<usize>,
+        read_accum: usize,
+        expected_total: usize,
     },
     Write {
         pages: Vec<PageWrite>,
@@ -176,13 +177,23 @@ impl InflightRequest {
             InflightRequestKind::Read {
                 buf,
                 completion,
-                result,
+                read_accum,
+                expected_total,
             } => match self.error {
                 Some(err) => completion.complete(Err(err)),
-                None => completion.complete(Ok((
-                    buf.expect("read buffer missing at completion"),
-                    result.expect("read result missing at completion"),
-                ))),
+                None => {
+                    if read_accum != expected_total {
+                        completion.complete(Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("short read: expected {expected_total}, got {read_accum}"),
+                        ))));
+                    } else {
+                        completion.complete(Ok((
+                            buf.expect("read buffer missing at completion"),
+                            read_accum,
+                        )));
+                    }
+                }
             },
             InflightRequestKind::Write { completion, .. } => match self.error {
                 Some(err) => completion.complete(Err(err)),
@@ -210,6 +221,61 @@ fn encode_user_data(request_id: RequestId, op_index: usize) -> u64 {
 
 fn decode_user_data(user_data: u64) -> (RequestId, usize) {
     ((user_data >> 32) as RequestId, user_data as u32 as usize)
+}
+
+fn read_op_count(buf: &ReadBuf) -> usize {
+    match buf {
+        ReadBuf::Fixed(alloc) if FixedBufferPool::buffers_registered() => {
+            FixedBufferPool::get_fixed_buffers(alloc).len()
+        }
+        _ => 1,
+    }
+}
+
+fn push_read_sqes<D: IoDriver>(
+    ring: &mut D,
+    fd: i32,
+    buf: &mut ReadBuf,
+    offset: u64,
+    request_id: RequestId,
+) -> Result<usize> {
+    if let ReadBuf::Fixed(alloc) = buf {
+        if FixedBufferPool::buffers_registered() {
+            let buffers = FixedBufferPool::get_fixed_buffers(alloc);
+            let n = buffers.len();
+            let mut file_off = offset;
+            for (i, fb) in buffers.iter().enumerate() {
+                let is_last = i + 1 == n;
+                let sqe = opcode::ReadFixed::new(
+                    types::Fd(fd),
+                    fb.ptr,
+                    fb.bytes as u32,
+                    fb.buf_id as u16,
+                )
+                .offset(file_off)
+                .build()
+                .flags(if is_last {
+                    io_uring::squeue::Flags::empty()
+                } else {
+                    io_uring::squeue::Flags::IO_LINK
+                })
+                .user_data(encode_user_data(request_id, i));
+                file_off += fb.bytes as u64;
+                ring.push(sqe)?;
+            }
+            return Ok(n);
+        }
+    }
+    let sqe = ReadEntry {
+        fd,
+        ptr: buf.as_mut_ptr(),
+        len: buf.len_u32(),
+        offset,
+        user_data: encode_user_data(request_id, 0),
+    }
+    .into();
+    ring.push(sqe)?;
+    Ok(1)
 }
 
 struct UringBackend<D: IoDriver> {
@@ -327,15 +393,18 @@ impl<D: IoDriver> UringBackend<D> {
                 offset,
                 completion,
             } => {
+                let expected_total = buf.len();
+                let num_ops = read_op_count(&buf);
                 self.inflight_requests.insert(
                     request_id,
                     InflightRequest {
-                        remaining: 1,
+                        remaining: num_ops,
                         error: None,
                         kind: InflightRequestKind::Read {
                             buf: Some(buf),
                             completion,
-                            result: None,
+                            read_accum: 0,
+                            expected_total,
                         },
                     },
                 );
@@ -348,15 +417,14 @@ impl<D: IoDriver> UringBackend<D> {
                     let InflightRequestKind::Read { buf, .. } = &mut request.kind else {
                         unreachable!("request kind changed while submitting read");
                     };
-                    self.ring.push(
-                        ReadEntry {
-                            fd: self.file.as_raw_fd(),
-                            buf: buf.as_mut().expect("read buffer missing while submitting"),
-                            offset,
-                            user_data: encode_user_data(request_id, 0),
-                        }
-                        .into(),
+                    push_read_sqes(
+                        &mut self.ring,
+                        self.file.as_raw_fd(),
+                        buf.as_mut().expect("read buffer missing while submitting"),
+                        offset,
+                        request_id,
                     )
+                    .map(|_| ())
                 };
                 self.finish_single_submit(request_id, push_result)
             }
@@ -450,10 +518,13 @@ impl<D: IoDriver> UringBackend<D> {
             };
 
             match &mut request.kind {
-                InflightRequestKind::Read { result, .. } => {
-                    debug_assert_eq!(op_index, 0, "read request should only have op 0");
+                InflightRequestKind::Read {
+                    read_accum,
+                    expected_total: _,
+                    ..
+                } => {
                     match decode_cqe_result(cqe.result) {
-                        Ok(n) => *result = Some(n),
+                        Ok(n) => *read_accum += n,
                         Err(err) if request.error.is_none() => request.error = Some(err),
                         Err(_) => {}
                     }
@@ -578,7 +649,8 @@ impl<D: IoDriver> UringBackend<D> {
 
 fn request_op_count(request: &WorkerRequest) -> usize {
     match request {
-        WorkerRequest::Read { .. } | WorkerRequest::Fsync { .. } => 1,
+        WorkerRequest::Read { buf, .. } => read_op_count(buf),
+        WorkerRequest::Fsync { .. } => 1,
         WorkerRequest::Write { writes, .. } => writes.len(),
     }
 }
@@ -628,7 +700,7 @@ impl IoWorker {
 }
 
 impl IoBackend for IoWorker {
-    fn read_at(&self, buf: AlignedBuf, offset: u64) -> ReadFutBox {
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> ReadFutBox {
         Box::pin(FileReadTask::new((*self.tx).clone(), buf, offset))
     }
 

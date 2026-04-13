@@ -1,6 +1,7 @@
 #![allow(clippy::assign_op_pattern)] // verus doesn't support assign op pattern
 
 pub mod art;
+mod memory;
 mod buffer;
 mod error;
 mod io_backend;

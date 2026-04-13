@@ -21,7 +21,8 @@ use async_task::Runnable;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue, types};
 
-use crate::buffer::AlignedBuf;
+use crate::buffer::ReadBuf;
+use crate::memory::pool::FixedBufferPool;
 use crate::error::{Error, Result};
 use crate::io_backend::{FsyncFutBox, IoBackend, ReadFutBox, WriteFutBox};
 use crate::io_task::PageWrite;
@@ -130,13 +131,15 @@ impl NonBlockingUring {
 }
 
 impl IoBackend for NonBlockingUring {
-    fn read_at(&self, buf: AlignedBuf, offset: u64) -> ReadFutBox {
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> ReadFutBox {
+        let expected_total = buf.len();
         Box::pin(WsReadFut {
             task: Arc::new(Mutex::new(WsReadTask {
                 buf: Some(buf),
                 offset,
                 error: None,
                 result_len: None,
+                expected_total,
             })),
             uring: None,
         })
@@ -166,19 +169,48 @@ pub(crate) trait IoUringTask: Send {
 }
 
 struct WsReadTask {
-    buf: Option<AlignedBuf>,
+    buf: Option<ReadBuf>,
     offset: u64,
     error: Option<Error>,
     result_len: Option<usize>,
+    expected_total: usize,
 }
 
 impl IoUringTask for WsReadTask {
     fn prepare_sqe(&mut self) -> Vec<squeue::Entry> {
-        let fd = types::Fd(
-            ws_worker_fd().expect("WorkStealing I/O must run on a work-stealing worker thread"),
-        );
-        let b = self.buf.as_mut().expect("read buffer");
-        let entry = opcode::Read::new(fd, b.as_mut_ptr(), b.len_u32())
+        let raw_fd = ws_worker_fd().expect("WorkStealing I/O must run on a work-stealing worker thread");
+        let fd = types::Fd(raw_fd);
+        let buf = self.buf.as_mut().expect("read buffer");
+        if let ReadBuf::Fixed(alloc) = buf {
+            if FixedBufferPool::buffers_registered() {
+                let buffers = FixedBufferPool::get_fixed_buffers(alloc);
+                let n = buffers.len();
+                let mut file_off = self.offset;
+                let mut out = Vec::with_capacity(n);
+                for (i, fb) in buffers.iter().enumerate() {
+                    let is_last = i + 1 == n;
+                    out.push(
+                        opcode::ReadFixed::new(
+                            fd,
+                            fb.ptr,
+                            fb.bytes as u32,
+                            fb.buf_id as u16,
+                        )
+                        .offset(file_off)
+                        .build()
+                        .flags(if is_last {
+                            squeue::Flags::empty()
+                        } else {
+                            squeue::Flags::IO_LINK
+                        })
+                        .user_data(0),
+                    );
+                    file_off += fb.bytes as u64;
+                }
+                return out;
+            }
+        }
+        let entry = opcode::Read::new(fd, buf.as_mut_ptr(), buf.len_u32())
             .offset(self.offset)
             .build()
             .user_data(0);
@@ -186,12 +218,29 @@ impl IoUringTask for WsReadTask {
     }
 
     fn complete(&mut self, cqes: Vec<&cqueue::Entry>) {
-        debug_assert_eq!(cqes.len(), 1);
-        let r = cqes[0].result();
-        if r < 0 {
-            self.error = Some(Error::Io(io::Error::from_raw_os_error(-r)));
-        } else {
-            self.result_len = Some(r as usize);
+        let mut sum = 0usize;
+        for cqe in cqes {
+            let r = cqe.result();
+            if r < 0 {
+                if self.error.is_none() {
+                    self.error = Some(Error::Io(io::Error::from_raw_os_error(-r)));
+                }
+            } else {
+                sum += r as usize;
+            }
+        }
+        if self.error.is_none() {
+            if sum != self.expected_total {
+                self.error = Some(Error::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "short read: expected {}, got {sum}",
+                        self.expected_total
+                    ),
+                )));
+            } else {
+                self.result_len = Some(sum);
+            }
         }
     }
 }
@@ -310,6 +359,9 @@ impl IoDriver {
             .setup_single_issuer()
             .setup_defer_taskrun()
             .build(URING_NUM_ENTRIES)?;
+        if let Err(e) = FixedBufferPool::register_buffers_with_ring(&ring) {
+            log::warn!("fixed buffer register_buffers failed: {e}");
+        }
 
         let mut tokens = VecDeque::with_capacity(MAX_CONCURRENT_IO as usize);
         let mut submitted_tasks = Vec::with_capacity(MAX_CONCURRENT_IO as usize);
@@ -588,7 +640,7 @@ fn uring_future_from_arc<T: IoUringTask + 'static>(task: Arc<Mutex<T>>) -> Uring
     }
 }
 
-fn take_ws_read_result(t: &mut WsReadTask) -> Result<(AlignedBuf, usize)> {
+fn take_ws_read_result(t: &mut WsReadTask) -> Result<(ReadBuf, usize)> {
     if let Some(e) = t.error.take() {
         return Err(e);
     }
@@ -608,7 +660,7 @@ pub struct WsReadFut {
 }
 
 impl Future for WsReadFut {
-    type Output = Result<(AlignedBuf, usize)>;
+    type Output = Result<(ReadBuf, usize)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -693,6 +745,7 @@ mod tests {
     use std::io::Write;
     use std::num::NonZeroU32;
 
+    use crate::buffer::{AlignedBuf, ReadBuf};
     use crate::io_backend::IoBackend;
 
     use super::*;
@@ -711,7 +764,9 @@ mod tests {
         .unwrap();
         let ws2 = ws.clone();
         ws.run_to_completion(async move {
-            let buf = AlignedBuf::new_zeroed(NonZeroU32::new(4096).unwrap()).unwrap();
+            let buf = ReadBuf::Aligned(
+                AlignedBuf::new_zeroed(NonZeroU32::new(4096).unwrap()).unwrap(),
+            );
             let (buf, n) = ws2.read_at(buf, 0).await.unwrap();
             assert_eq!(n, 4096);
             assert_eq!(buf.as_slice()[0], 0xab);
@@ -742,7 +797,9 @@ mod tests {
                 .unwrap();
             ws2.fsync().await.unwrap();
 
-            let buf = AlignedBuf::new_zeroed(NonZeroU32::new(4096).unwrap()).unwrap();
+            let buf = ReadBuf::Aligned(
+                AlignedBuf::new_zeroed(NonZeroU32::new(4096).unwrap()).unwrap(),
+            );
             let (buf, n) = ws2.read_at(buf, 0).await.unwrap();
             assert_eq!(n, 4096);
             assert_eq!(buf.as_slice()[0], 0x77);

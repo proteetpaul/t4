@@ -2,13 +2,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use crate::buffer::AlignedBuf;
+use crate::buffer::{AlignedBuf, ReadBuf};
 use crate::error::{Error, Result};
 use crate::sync::cooperative_yield;
 use crate::sync::mpsc;
 use crate::sync::{Arc, Mutex};
 
-pub(crate) type ReadCompletion = Arc<TaskCompletion<(AlignedBuf, usize)>>;
+pub(crate) type ReadCompletion = Arc<TaskCompletion<(ReadBuf, usize)>>;
 pub(crate) type WriteCompletion = Arc<TaskCompletion<()>>;
 pub(crate) type FsyncCompletion = Arc<TaskCompletion<()>>;
 
@@ -100,7 +100,7 @@ pub(crate) fn worker_disconnected_error() -> Error {
 
 pub(crate) enum WorkerRequest {
     Read {
-        buf: AlignedBuf,
+        buf: ReadBuf,
         offset: u64,
         completion: ReadCompletion,
     },
@@ -115,7 +115,7 @@ pub(crate) enum WorkerRequest {
 
 struct PendingRead {
     tx: mpsc::Sender<WorkerRequest>,
-    buf: Option<AlignedBuf>,
+    buf: Option<ReadBuf>,
     offset: u64,
 }
 
@@ -130,7 +130,7 @@ enum FileReadTaskState {
 }
 
 impl FileReadTask {
-    pub(crate) fn new(tx: mpsc::Sender<WorkerRequest>, buf: AlignedBuf, offset: u64) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<WorkerRequest>, buf: ReadBuf, offset: u64) -> Self {
         Self {
             state: FileReadTaskState::Init(PendingRead {
                 tx,
@@ -142,7 +142,7 @@ impl FileReadTask {
 }
 
 impl Future for FileReadTask {
-    type Output = Result<(AlignedBuf, usize)>;
+    type Output = Result<(ReadBuf, usize)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();

@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use std::ptr::NonNull;
 
 use crate::error::{Error, Result};
+use crate::memory::pool::{FixedBufferAllocation, FixedBufferPool};
 use crate::{PAGE_SIZE, PAGE_SIZE_NZ_U32};
 
 pub use verified::{align_down_u64, align_up_u64};
@@ -107,4 +108,63 @@ impl Drop for AlignedBuf {
     fn drop(&mut self) {
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
+}
+
+/// Read buffer: heap-aligned or fixed-buffer-pool allocation (for `Read` / `ReadFixed`).
+pub enum ReadBuf {
+    Aligned(AlignedBuf),
+    Fixed(FixedBufferAllocation),
+}
+
+impl ReadBuf {
+    pub fn len(&self) -> usize {
+        match self {
+            ReadBuf::Aligned(b) => b.len(),
+            ReadBuf::Fixed(f) => f.size,
+        }
+    }
+
+    pub(crate) fn len_u32(&self) -> u32 {
+        self.len() as u32
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            ReadBuf::Aligned(b) => b.as_mut_ptr(),
+            ReadBuf::Fixed(f) => f.ptr,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ReadBuf::Aligned(b) => b.as_slice(),
+            ReadBuf::Fixed(f) => f.as_ref(),
+        }
+    }
+
+    pub fn try_into_boxed_page(self) -> Result<Box<[u8; PAGE_SIZE]>> {
+        match self {
+            ReadBuf::Aligned(b) => b.try_into_boxed_array(),
+            ReadBuf::Fixed(f) => {
+                if f.size != PAGE_SIZE {
+                    return Err(Error::InvalidArgument("invalid page buffer size"));
+                }
+                let mut arr = Box::new([0u8; PAGE_SIZE]);
+                arr.copy_from_slice(f.as_ref());
+                Ok(arr)
+            }
+        }
+    }
+}
+
+/// Prefer the fixed buffer pool after [`FixedBufferPool::init`](crate::memory::pool::FixedBufferPool::init); fall back to [`AlignedBuf`].
+pub fn try_read_buf(len: NonZeroU32) -> Result<ReadBuf> {
+    let n = len.get() as usize;
+    if FixedBufferPool::is_initialized() {
+        let ptr = FixedBufferPool::malloc(n);
+        if !ptr.is_null() {
+            return Ok(ReadBuf::Fixed(FixedBufferAllocation { ptr, size: n }));
+        }
+    }
+    Ok(ReadBuf::Aligned(AlignedBuf::new_zeroed(len)?))
 }

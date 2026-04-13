@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::buffer::AlignedBuf;
+use crate::buffer::{AlignedBuf, try_read_buf};
 use crate::error::{Error, Result};
 use crate::io_backend::{read_exact_at, IoBackendRef};
 use crate::io_task::PageWrite;
@@ -182,11 +182,9 @@ impl Wal {
     }
 
     async fn read_page(io: &IoBackendRef, offset: u64) -> Result<WalPage> {
-        let buf = AlignedBuf::new_zeroed(PAGE_SIZE_NZ_U32)?;
+        let buf = try_read_buf(PAGE_SIZE_NZ_U32)?;
         let buf = read_exact_at(io, buf, offset).await?;
-        let boxed = buf
-            .try_into_boxed_array()
-            .expect("invalid aligned buffer layout");
+        let boxed = buf.try_into_boxed_page()?;
         Ok(WalPage::from_bytes(boxed)?)
     }
 }

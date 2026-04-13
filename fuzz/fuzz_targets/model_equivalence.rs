@@ -76,6 +76,7 @@ fn test_options() -> MountOptions {
         direct_io: false,
         dsync: false,
         io_backend: t4::IoBackendKind::DedicatedThread,
+        fixed_buffer_pool_size_mb: 128,
     }
 }
 
