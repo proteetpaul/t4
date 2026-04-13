@@ -12,7 +12,7 @@ use verified::{CheckedRangeU32, RangeRequestU32};
 use crate::buffer::{align_down_u64, align_up_u32, align_up_u64, try_read_buf};
 use crate::memory::pool::FixedBufferPool;
 use crate::error::{Error, Result};
-use crate::io_backend::{read_exact_at, IoBackendRef};
+use crate::io_backend::{read_exact_at, IoBackend, IoBackendRef, IoDispatcher};
 #[cfg(not(feature = "shuttle"))]
 use crate::uring_runtime::NonBlockingUring;
 use crate::io_worker::IoWorker;
@@ -81,7 +81,7 @@ impl T4Store {
         {
             if let IoBackendKind::WorkStealing { io_threads } = options.io_backend {
                 let ws = NonBlockingUring::new(&file, queue_depth, io_threads)?;
-                let io: IoBackendRef = Arc::new(ws.clone());
+                let io: IoBackendRef = Arc::new(IoDispatcher::WorkStealing(ws.clone()));
                 let io_mount = io.clone();
                 let (wal, index) = ws.run_to_completion(async move {
                     Self::open_wal_and_index(io_mount, len).await
@@ -94,7 +94,7 @@ impl T4Store {
             }
         }
 
-        let io: IoBackendRef = Arc::new(IoWorker::new(queue_depth, file)?);
+        let io: IoBackendRef = Arc::new(IoDispatcher::Dedicated(IoWorker::new(queue_depth, file)?));
         let (wal, index) = Self::open_wal_and_index(io.clone(), len).await?;
         Ok(Self {
             io,

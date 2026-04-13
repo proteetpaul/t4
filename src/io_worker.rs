@@ -9,7 +9,7 @@ use io_uring::{IoUring, opcode, types};
 use crate::buffer::{AlignedBuf, ReadBuf};
 use crate::memory::pool::FixedBufferPool;
 use crate::error::{Error, Result};
-use crate::io_backend::{FsyncFutBox, IoBackend, ReadFutBox, WriteFutBox};
+use crate::io_backend::IoBackend;
 use crate::io_task::{
     FileFsyncTask, FileReadTask, FileWriteTask, PageWrite, WorkerRequest, worker_disconnected_error,
 };
@@ -700,15 +700,19 @@ impl IoWorker {
 }
 
 impl IoBackend for IoWorker {
-    fn read_at(&self, buf: ReadBuf, offset: u64) -> ReadFutBox {
-        Box::pin(FileReadTask::new((*self.tx).clone(), buf, offset))
+    type ReadFut = FileReadTask;
+    type WriteFut = FileWriteTask;
+    type FsyncFut = FileFsyncTask;
+
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> FileReadTask {
+        FileReadTask::new((*self.tx).clone(), buf, offset)
     }
 
-    fn write(&self, writes: Vec<PageWrite>) -> WriteFutBox {
-        Box::pin(FileWriteTask::new((*self.tx).clone(), writes))
+    fn write(&self, writes: Vec<PageWrite>) -> FileWriteTask {
+        FileWriteTask::new((*self.tx).clone(), writes)
     }
 
-    fn fsync(&self) -> FsyncFutBox {
-        Box::pin(FileFsyncTask::new((*self.tx).clone()))
+    fn fsync(&self) -> FileFsyncTask {
+        FileFsyncTask::new((*self.tx).clone())
     }
 }

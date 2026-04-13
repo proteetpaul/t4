@@ -1,34 +1,15 @@
-//! Pluggable disk I/O: [`IoBackend`] for [`IoWorker`](crate::io_worker::IoWorker) and
-//! [`WorkStealingIo`](crate::uring_runtime::WorkStealingIo).
+//! Disk I/O for [`IoWorker`](crate::io_worker::IoWorker) and work-stealing
+//! [`NonBlockingUring`](crate::uring_runtime::NonBlockingUring).
 //!
-//! # Design: trait objects and boxed futures (current approach)
+//! # Design: enum dispatch + associated-type futures
 //!
-//! [`IoBackend`] is **object-safe**: methods return type-erased
-//! `Pin<Box<dyn Future<Output = …> + Send + 'static>>` instead of associated types. Store and WAL
-//! hold a single [`IoArc`] (`Arc<dyn IoBackend + Send + Sync>`), so there is no hand-written
-//! dispatcher enum for backends.
+//! Store and WAL hold [`IoBackendRef`] (`Arc<IoDispatcher>`). [`IoDispatcher`] is a closed enum
+//! over the built-in backends; [`IoReadFut`] / [`IoWriteFut`] / [`IoFsyncFut`] wrap each backend’s
+//! concrete future and implement [`Future`] with a single `match` (static dispatch, no `dyn Future`).
 //!
-//! **Pros**
-//! - One concrete handle type for [`crate::store::T4Store`] / [`crate::wal::Wal`].
-//! - Object-safe trait; third-party backends could implement [`IoBackend`] behind the same `Arc`.
-//!
-//! **Cons**
-//! - **Extra heap allocation** per `read_at` / `write` / `fsync` (the `Box` for the future).
-//! - **Dynamic dispatch** on every `poll` of those futures (vtable), vs static dispatch for a
-//!   concrete future type.
-//!
-//! # Alternative: associated types + enum (lower overhead)
-//!
-//! For **maximum performance**, prefer either:
-//! - **Generic store**: `T4Store<B: IoBackend>` with an [`IoBackend`] trait that uses associated
-//!   types for each return future (`FileReadTask`, `WsReadFut`, …), **or**
-//! - **Manual enum dispatch**: a dedicated `IoDispatcher` enum plus per-operation enums
-//!   (`IoReadFut`, …) that wrap each backend’s future and implement [`Future`] with a single `match`.
-//!
-//! In both cases the **pollable future** is typically stored **inline** in the caller’s async
-//! state machine (no per-call `Box` solely to erase the future type), and dispatch is **static**
-//! (monomorphized or enum branch) rather than `dyn Future`. Use this crate’s object-safe API when
-//! simplicity and pluggability matter more than shaving those allocations.
+//! [`IoBackend`] uses associated types for each operation’s future so [`read_at`](IoBackend::read_at),
+//! [`write`](IoBackend::write), and [`fsync`](IoBackend::fsync) return stack-sized futures with no
+//! extra `Box` solely to erase the type.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -37,26 +18,119 @@ use std::task::{Context, Poll};
 
 use crate::buffer::ReadBuf;
 use crate::error::{Error, Result};
-use crate::io_task::PageWrite;
+use crate::io_task::{FileFsyncTask, FileReadTask, FileWriteTask, PageWrite};
+use crate::io_worker::IoWorker;
+#[cfg(not(feature = "shuttle"))]
+use crate::uring_runtime::{NonBlockingUring, WsFsyncFut, WsReadFut, WsWriteFut};
 
-/// Shared handle to any [`IoBackend`] (clone is cheap: clones the `Arc`).
-pub(crate) type IoBackendRef = Arc<dyn IoBackend + Send + Sync>;
+/// Shared handle (clone is cheap: clones the `Arc`).
+pub(crate) type IoBackendRef = Arc<IoDispatcher>;
 
-/// Type-erased read future (one heap allocation per `read_at` in this design).
-pub(crate) type ReadFutBox = Pin<Box<dyn Future<Output = Result<(ReadBuf, usize)>> + Send + 'static>>;
+/// Built-in I/O backends used by the store.
+pub(crate) enum IoDispatcher {
+    Dedicated(IoWorker),
+    #[cfg(not(feature = "shuttle"))]
+    WorkStealing(NonBlockingUring),
+}
 
-pub(crate) type WriteFutBox = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+/// Read future: dispatches to the active backend’s concrete future.
+pub(crate) enum IoReadFut {
+    Dedicated(FileReadTask),
+    #[cfg(not(feature = "shuttle"))]
+    WorkStealing(WsReadFut),
+}
 
-pub(crate) type FsyncFutBox = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+/// Write future: dispatches to the active backend’s concrete future.
+pub(crate) enum IoWriteFut {
+    Dedicated(FileWriteTask),
+    #[cfg(not(feature = "shuttle"))]
+    WorkStealing(WsWriteFut),
+}
+
+/// Fsync future: dispatches to the active backend’s concrete future.
+pub(crate) enum IoFsyncFut {
+    Dedicated(FileFsyncTask),
+    #[cfg(not(feature = "shuttle"))]
+    WorkStealing(WsFsyncFut),
+}
+
+impl Future for IoReadFut {
+    type Output = Result<(ReadBuf, usize)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            IoReadFut::Dedicated(f) => Pin::new(f).poll(cx),
+            #[cfg(not(feature = "shuttle"))]
+            IoReadFut::WorkStealing(f) => Pin::new(f).poll(cx),
+        }
+    }
+}
+
+impl Future for IoWriteFut {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            IoWriteFut::Dedicated(f) => Pin::new(f).poll(cx),
+            #[cfg(not(feature = "shuttle"))]
+            IoWriteFut::WorkStealing(f) => Pin::new(f).poll(cx),
+        }
+    }
+}
+
+impl Future for IoFsyncFut {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            IoFsyncFut::Dedicated(f) => Pin::new(f).poll(cx),
+            #[cfg(not(feature = "shuttle"))]
+            IoFsyncFut::WorkStealing(f) => Pin::new(f).poll(cx),
+        }
+    }
+}
 
 /// Async store I/O: reads, writes, and fsync against one backing file.
 ///
-/// Implemented by [`crate::io_worker::IoWorker`] and [`crate::uring_runtime::WorkStealingIo`].
-/// Sharing uses [`IoArc`]; the trait does not require [`Clone`] on `Self`.
+/// Implemented by [`IoWorker`], [`NonBlockingUring`], and [`IoDispatcher`].
 pub(crate) trait IoBackend: Send + Sync {
-    fn read_at(&self, buf: ReadBuf, offset: u64) -> ReadFutBox;
-    fn write(&self, writes: Vec<PageWrite>) -> WriteFutBox;
-    fn fsync(&self) -> FsyncFutBox;
+    type ReadFut: Future<Output = Result<(ReadBuf, usize)>> + Send;
+    type WriteFut: Future<Output = Result<()>> + Send;
+    type FsyncFut: Future<Output = Result<()>> + Send;
+
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> Self::ReadFut;
+    fn write(&self, writes: Vec<PageWrite>) -> Self::WriteFut;
+    fn fsync(&self) -> Self::FsyncFut;
+}
+
+impl IoBackend for IoDispatcher {
+    type ReadFut = IoReadFut;
+    type WriteFut = IoWriteFut;
+    type FsyncFut = IoFsyncFut;
+
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> IoReadFut {
+        match self {
+            IoDispatcher::Dedicated(w) => IoReadFut::Dedicated(w.read_at(buf, offset)),
+            #[cfg(not(feature = "shuttle"))]
+            IoDispatcher::WorkStealing(ws) => IoReadFut::WorkStealing(ws.read_at(buf, offset)),
+        }
+    }
+
+    fn write(&self, writes: Vec<PageWrite>) -> IoWriteFut {
+        match self {
+            IoDispatcher::Dedicated(w) => IoWriteFut::Dedicated(w.write(writes)),
+            #[cfg(not(feature = "shuttle"))]
+            IoDispatcher::WorkStealing(ws) => IoWriteFut::WorkStealing(ws.write(writes)),
+        }
+    }
+
+    fn fsync(&self) -> IoFsyncFut {
+        match self {
+            IoDispatcher::Dedicated(w) => IoFsyncFut::Dedicated(w.fsync()),
+            #[cfg(not(feature = "shuttle"))]
+            IoDispatcher::WorkStealing(ws) => IoFsyncFut::WorkStealing(ws.fsync()),
+        }
+    }
 }
 
 /// How to run io_uring for the store file.
@@ -91,7 +165,7 @@ enum ReadExactState {
         buf: Option<ReadBuf>,
         offset: u64,
     },
-    Reading(ReadFutBox),
+    Reading(IoReadFut),
 }
 
 impl ReadExactAt {
@@ -120,7 +194,7 @@ impl Future for ReadExactAt {
                     let fut = this.io.read_at(buf, offset);
                     this.state = Some(ReadExactState::Reading(fut));
                 }
-                Some(ReadExactState::Reading(mut fut)) => match fut.as_mut().poll(cx) {
+                Some(ReadExactState::Reading(mut fut)) => match Pin::new(&mut fut).poll(cx) {
                     Poll::Ready(Ok((buf, n))) => {
                         if n != this.expected {
                             this.state = None;

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::buffer::{AlignedBuf, try_read_buf};
 use crate::error::{Error, Result};
-use crate::io_backend::{read_exact_at, IoBackendRef};
+use crate::io_backend::{read_exact_at, IoBackend, IoBackendRef};
 use crate::io_task::PageWrite;
 use crate::sync::{Mutex, MutexGuard};
 use crate::{PAGE_SIZE_NZ_U32, PAGE_SIZE_U32, PAGE_SIZE_U64};

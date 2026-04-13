@@ -24,7 +24,7 @@ use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue, types};
 use crate::buffer::ReadBuf;
 use crate::memory::pool::FixedBufferPool;
 use crate::error::{Error, Result};
-use crate::io_backend::{FsyncFutBox, IoBackend, ReadFutBox, WriteFutBox};
+use crate::io_backend::IoBackend;
 use crate::io_task::PageWrite;
 use crate::sync::cooperative_yield;
 
@@ -131,9 +131,13 @@ impl NonBlockingUring {
 }
 
 impl IoBackend for NonBlockingUring {
-    fn read_at(&self, buf: ReadBuf, offset: u64) -> ReadFutBox {
+    type ReadFut = WsReadFut;
+    type WriteFut = WsWriteFut;
+    type FsyncFut = WsFsyncFut;
+
+    fn read_at(&self, buf: ReadBuf, offset: u64) -> WsReadFut {
         let expected_total = buf.len();
-        Box::pin(WsReadFut {
+        WsReadFut {
             task: Arc::new(Mutex::new(WsReadTask {
                 buf: Some(buf),
                 offset,
@@ -142,24 +146,24 @@ impl IoBackend for NonBlockingUring {
                 expected_total,
             })),
             uring: None,
-        })
+        }
     }
 
-    fn write(&self, writes: Vec<PageWrite>) -> WriteFutBox {
-        Box::pin(WsWriteFut {
+    fn write(&self, writes: Vec<PageWrite>) -> WsWriteFut {
+        WsWriteFut {
             task: Arc::new(Mutex::new(WsWriteTask {
                 pages: writes,
                 error: None,
             })),
             uring: None,
-        })
+        }
     }
 
-    fn fsync(&self) -> FsyncFutBox {
-        Box::pin(WsFsyncFut {
+    fn fsync(&self) -> WsFsyncFut {
+        WsFsyncFut {
             task: Arc::new(Mutex::new(WsFsyncTask { error: None })),
             uring: None,
-        })
+        }
     }
 }
 
